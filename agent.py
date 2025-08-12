@@ -29,6 +29,7 @@ from llama_index.core import (
     SimpleDirectoryReader,
     Settings,
 )
+from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.llms.openai import OpenAI as LlamaOpenAI
 
@@ -53,8 +54,15 @@ def _init_llamaindex_settings() -> None:
     Configure global LlamaIndex settings for embeddings and LLM.
     We use OpenAI for both, leveraging the OPENAI_API_KEY from the environment.
     """
-    Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+    # Favor precision for chapter-specific facts
+    Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-large")
     Settings.llm = LlamaOpenAI(model="gpt-4o-mini")
+    # Configure robust chunking for better retrieval granularity
+    Settings.node_parser = SentenceSplitter(
+        chunk_size=1024,
+        chunk_overlap=120,
+        separator="\n",
+    )
 
 
 def _cookbook_pdf_path() -> str:
@@ -106,6 +114,28 @@ def get_cookbook_query_engine():
     return index.as_query_engine(response_mode="compact")
 
 
+def get_cookbook_retriever(top_k: int = 6):
+    """Return a retriever for the cookbook index."""
+    index = build_or_load_cookbook_index()
+    return index.as_retriever(similarity_top_k=top_k)
+
+
+def _extract_chapter_hint(text: str) -> str | None:
+    """Detect a chapter hint like 'chapter 3' or 'chapter: Meal Prep Basics'."""
+    t = text.lower()
+    # Simple numeric match
+    import re
+
+    m = re.search(r"chapter\s*(\d+)", t)
+    if m:
+        return f"chapter {m.group(1)}"
+    # Title-like hint: 'chapter: foo'
+    m2 = re.search(r"chapter\s*[:\-]\s*([\w\s]+)", t)
+    if m2:
+        return f"chapter {m2.group(1).strip()}"
+    return None
+
+
 # --------------------------------
 # Tool: Cookbook RAG Query (LLM-Fn)
 # --------------------------------
@@ -113,13 +143,53 @@ def get_cookbook_query_engine():
 @function_tool()
 def query_cookbook(question: str) -> str:
     """
-    Query the meal prep cookbook to answer questions about recipes, ingredients, or techniques.
-    Always call this when the user asks for specific information that likely exists in the book.
+    High-precision RAG over the cookbook for chapter-specific facts.
+    Returns a concise answer with citations to page numbers when available.
     """
-    engine = get_cookbook_query_engine()
-    response = engine.query(question)
-    # LlamaIndex returns a Response object; extract text for the LLM to read aloud
-    return str(response)
+    retriever = get_cookbook_retriever(top_k=8)
+    nodes = retriever.retrieve(question)
+
+    chapter_hint = _extract_chapter_hint(question)
+    if chapter_hint:
+        # Simple re-ranking: promote nodes that mention the chapter hint
+        def score(n):
+            content = (n.node.get_content(metadata=False) or "").lower()
+            return (chapter_hint in content)
+
+        nodes = sorted(nodes, key=lambda n: score(n), reverse=True)
+
+    # Build concise context with citations
+    context_chunks = []
+    citations = []
+    for n in nodes[:4]:
+        content = (n.node.get_content(metadata=False) or "").strip()
+        if not content:
+            continue
+        meta = n.node.metadata or {}
+        page = meta.get("page_label") or meta.get("page")
+        if page is not None:
+            citations.append(str(page))
+        # keep chunks short to avoid latency
+        context_chunks.append(content[:800])
+
+    combined_context = "\n---\n".join(context_chunks)
+    cite_str = f" (pages {', '.join(dict.fromkeys(citations))})" if citations else ""
+
+    # Synthesize a concise answer using the LLM anchored to retrieved context
+    try:
+        prompt = (
+            "You are answering a question using the provided cookbook context. "
+            "Cite page numbers in parentheses if present. Be precise and concise.\n\n"
+            f"Question: {question}\n\n"
+            f"Context{cite_str}:\n{combined_context}\n\n"
+            "Answer:"
+        )
+        comp = Settings.llm.complete(prompt)
+        text = getattr(comp, "text", None) or str(comp)
+        return (text.strip() + (f" {cite_str}" if cite_str else "")).strip()
+    except Exception:
+        # Fallback: return the most relevant snippets with citations
+        return f"Context{cite_str}: {combined_context}"
 
 
 # --------------------------------------
@@ -283,7 +353,9 @@ class ChefRamsay(Agent):
         Inject cookbook RAG context before LLM generation, following
         https://docs.livekit.io/agents/build/external-data/#add-context-during-conversation
         """
-        text = new_message.text_content() if hasattr(new_message, "text_content") else None
+        # Get message text; accommodate versions where it's a property, not a method
+        tc = getattr(new_message, "text_content", None)
+        text = tc() if callable(tc) else tc
         if not text:
             return
 
@@ -311,16 +383,33 @@ class ChefRamsay(Agent):
             return
 
         try:
-            engine = get_cookbook_query_engine()
-            rag_response = engine.query(text)
-            rag_text = str(rag_response).strip()
-            if rag_text:
+            retriever = get_cookbook_retriever(top_k=5)
+            nodes = retriever.retrieve(text)
+
+            chapter_hint = _extract_chapter_hint(text)
+            if chapter_hint:
+                def score(n):
+                    content = (n.node.get_content(metadata=False) or "").lower()
+                    return (chapter_hint in content)
+                nodes = sorted(nodes, key=lambda n: score(n), reverse=True)
+
+            snippets = []
+            pages = []
+            for n in nodes[:3]:
+                content = (n.node.get_content(metadata=False) or "").strip()
+                if content:
+                    snippets.append(content[:500])
+                meta = n.node.metadata or {}
+                page = meta.get("page_label") or meta.get("page")
+                if page is not None:
+                    pages.append(str(page))
+
+            if snippets:
+                cite = ", ".join(dict.fromkeys(pages))
+                condensed = " \n---\n".join(snippets)
                 turn_ctx.add_message(
                     role="assistant",
-                    content=(
-                        "Cookbook context: "
-                        + rag_text
-                    ),
+                    content=f"Cookbook context{(f' (pages {cite})' if cite else '')}: {condensed}",
                 )
         except Exception as e:
             # Non-fatal: if RAG fails, continue without extra context
