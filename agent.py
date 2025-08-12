@@ -1,6 +1,17 @@
+import os
+from functools import lru_cache
+from typing import Dict
+
 from dotenv import load_dotenv
 from livekit import agents
-from livekit.agents import AgentSession, Agent, RoomInputOptions
+from livekit.agents import (
+    AgentSession,
+    Agent,
+    RoomInputOptions,
+    function_tool,
+    ChatContext,
+    ChatMessage,
+)
 from livekit.plugins import (
     openai,
     cartesia,
@@ -10,14 +21,234 @@ from livekit.plugins import (
 )
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
+# LlamaIndex (RAG) imports
+from llama_index.core import (
+    VectorStoreIndex,
+    StorageContext,
+    load_index_from_storage,
+    SimpleDirectoryReader,
+    Settings,
+)
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.llms.openai import OpenAI as LlamaOpenAI
+
 load_dotenv()
 
-# We will define our tool here later, but for now, we'll keep it simple
-# to focus on the persona change.
-# You will create a function like this for your measurement converter.
-# def convert_measurements(value: float, unit_from: str, unit_to: str):
-#     # ... your conversion logic goes here ...
-#     return converted_value
+# ---------------------------
+# RAG: Cookbook Index Helpers
+# ---------------------------
+
+def _project_path(*rel_parts: str) -> str:
+    """Resolve an absolute path under the project directory."""
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), *rel_parts))
+
+
+def _ensure_dirs(path: str) -> None:
+    """Create directories for a given path if they do not exist."""
+    os.makedirs(path, exist_ok=True)
+
+
+def _init_llamaindex_settings() -> None:
+    """
+    Configure global LlamaIndex settings for embeddings and LLM.
+    We use OpenAI for both, leveraging the OPENAI_API_KEY from the environment.
+    """
+    Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+    Settings.llm = LlamaOpenAI(model="gpt-4o-mini")
+
+
+def _cookbook_pdf_path() -> str:
+    """Return the absolute path to the cookbook PDF in `docs/`."""
+    return _project_path("docs", "Stealth Health - Meal Planning.pdf")
+
+
+def _cookbook_index_dir() -> str:
+    """Directory where the VectorStoreIndex is persisted on disk."""
+    return _project_path("storage", "cookbook_index")
+
+
+def build_or_load_cookbook_index() -> VectorStoreIndex:
+    """
+    Build a VectorStoreIndex from the cookbook PDF if not already persisted; otherwise load it.
+    The index is stored under `storage/cookbook_index`.
+    """
+    _init_llamaindex_settings()
+
+    persist_dir = _cookbook_index_dir()
+    _ensure_dirs(persist_dir)
+
+    try:
+        # Try to load an existing index first for fast startup
+        storage_context = StorageContext.from_defaults(persist_dir=persist_dir)
+        index = load_index_from_storage(storage_context)
+        return index
+    except Exception:
+        # Fall back to building from the source PDF
+        pdf_path = _cookbook_pdf_path()
+        if not os.path.exists(pdf_path):
+            raise FileNotFoundError(
+                f"Cookbook PDF not found at '{pdf_path}'. Please ensure the file exists."
+            )
+
+        documents = SimpleDirectoryReader(input_files=[pdf_path]).load_data()
+        index = VectorStoreIndex.from_documents(documents)
+        index.storage_context.persist(persist_dir=persist_dir)
+        return index
+
+
+@lru_cache(maxsize=1)
+def get_cookbook_query_engine():
+    """
+    Create (and cache) a LlamaIndex query engine for the cookbook.
+    Using an LRU cache ensures we only build/load once per process.
+    """
+    index = build_or_load_cookbook_index()
+    return index.as_query_engine(response_mode="compact")
+
+
+# --------------------------------
+# Tool: Cookbook RAG Query (LLM-Fn)
+# --------------------------------
+
+@function_tool()
+def query_cookbook(question: str) -> str:
+    """
+    Query the meal prep cookbook to answer questions about recipes, ingredients, or techniques.
+    Always call this when the user asks for specific information that likely exists in the book.
+    """
+    engine = get_cookbook_query_engine()
+    response = engine.query(question)
+    # LlamaIndex returns a Response object; extract text for the LLM to read aloud
+    return str(response)
+
+
+# --------------------------------------
+# Tool: Measurement Conversion (LLM-Fn)
+# --------------------------------------
+
+def _normalize_unit(raw_unit: str) -> str:
+    """Normalize unit strings to canonical tokens."""
+    u = raw_unit.strip().lower().replace(".", "").replace(" ", "")
+    aliases: Dict[str, str] = {
+        # volume
+        "cup": "cup",
+        "cups": "cup",
+        "tbsp": "tbsp",
+        "tablespoon": "tbsp",
+        "tablespoons": "tbsp",
+        "tbs": "tbsp",
+        "tsp": "tsp",
+        "teaspoon": "tsp",
+        "teaspoons": "tsp",
+        "ml": "ml",
+        "milliliter": "ml",
+        "millilitre": "ml",
+        "milliliters": "ml",
+        "millilitres": "ml",
+        "l": "l",
+        "liter": "l",
+        "litre": "l",
+        "liters": "l",
+        "litres": "l",
+        "floz": "fl_oz",
+        "fl_oz": "fl_oz",
+        "fluidounce": "fl_oz",
+        "fluidounces": "fl_oz",
+        # mass
+        "g": "g",
+        "gram": "g",
+        "grams": "g",
+        "kg": "kg",
+        "kilogram": "kg",
+        "kilograms": "kg",
+        "oz": "oz",  # mass ounce
+        "ounce": "oz",
+        "ounces": "oz",
+        "lb": "lb",
+        "lbs": "lb",
+        "pound": "lb",
+        "pounds": "lb",
+    }
+    return aliases.get(u, u)
+
+
+VOLUME_TO_ML: Dict[str, float] = {
+    "cup": 240.0,
+    "tbsp": 15.0,
+    "tsp": 5.0,
+    "ml": 1.0,
+    "l": 1000.0,
+    "fl_oz": 29.5735,
+}
+
+MASS_TO_G: Dict[str, float] = {
+    "g": 1.0,
+    "kg": 1000.0,
+    "oz": 28.3495,
+    "lb": 453.592,
+}
+
+
+def _is_volume(unit: str) -> bool:
+    return unit in VOLUME_TO_ML
+
+
+def _is_mass(unit: str) -> bool:
+    return unit in MASS_TO_G
+
+
+@function_tool()
+def convert_measurements(value: float, unit_from: str, unit_to: str) -> float:
+    """
+    Convert common cooking measurements.
+
+    Supported volume units: cup, tbsp, tsp, ml, l, fl_oz
+    Supported mass units: g, kg, oz, lb
+
+    Converting between volume and mass assumes a density of 1 g/ml (water-like),
+    which is an approximation. For ingredients like flour or oil, results may vary.
+    """
+    if value is None:
+        raise ValueError("'value' must be provided")
+
+    uf = _normalize_unit(unit_from)
+    ut = _normalize_unit(unit_to)
+
+    if uf == ut:
+        return float(round(value, 4))
+
+    # Volume → Volume
+    if _is_volume(uf) and _is_volume(ut):
+        ml_value = value * VOLUME_TO_ML[uf]
+        result = ml_value / VOLUME_TO_ML[ut]
+        return float(round(result, 4))
+
+    # Mass → Mass
+    if _is_mass(uf) and _is_mass(ut):
+        g_value = value * MASS_TO_G[uf]
+        result = g_value / MASS_TO_G[ut]
+        return float(round(result, 4))
+
+    # Cross-dimension using default density of 1 g/ml
+    DENSITY_G_PER_ML = 1.0
+
+    # Volume → Mass
+    if _is_volume(uf) and _is_mass(ut):
+        ml_value = value * VOLUME_TO_ML[uf]
+        g_value = ml_value * DENSITY_G_PER_ML
+        result = g_value / MASS_TO_G[ut]
+        return float(round(result, 4))
+
+    # Mass → Volume
+    if _is_mass(uf) and _is_volume(ut):
+        g_value = value * MASS_TO_G[uf]
+        ml_value = g_value / DENSITY_G_PER_ML
+        result = ml_value / VOLUME_TO_ML[ut]
+        return float(round(result, 4))
+
+    raise ValueError(
+        f"Unsupported conversion from '{unit_from}' to '{unit_to}'."
+    )
 
 
 class ChefRamsay(Agent):
@@ -33,31 +264,90 @@ class ChefRamsay(Agent):
                 "You will not tolerate mistakes or laziness from the user. "
                 "When asked for a recipe or cooking advice, you will provide "
                 "it in your characteristic tough-love style. "
-                "Keep your responses direct and to the point."
-            )
+                "Keep your responses direct and to the point. "
+                "You have access to a meal prep cookbook and a measurement conversion tool. "
+                "You must use these resources to answer questions and fulfill user requests. "
+                "When the user asks about recipes, ingredients, or meal prep techniques, "
+                "query the cookbook tool to retrieve precise information. "
+                "When the user requests conversions (e.g., cups to grams), call the conversion tool. "
+                "Always maintain your Gordon Ramsay persona in responses."
+            ),
+            # Register tools here per LiveKit's tool-call pattern
+            tools=[query_cookbook, convert_measurements],
         )
+
+    async def on_user_turn_completed(
+        self, turn_ctx: ChatContext, new_message: ChatMessage
+    ) -> None:
+        """
+        Inject cookbook RAG context before LLM generation, following
+        https://docs.livekit.io/agents/build/external-data/#add-context-during-conversation
+        """
+        text = new_message.text_content() if hasattr(new_message, "text_content") else None
+        if not text:
+            return
+
+        # Simple heuristic: only fetch RAG context if message seems like a question
+        # or references core cooking topics to avoid unnecessary queries.
+        lower = text.lower()
+        triggers = [
+            "recipe",
+            "ingredient",
+            "ingredients",
+            "prep",
+            "meal prep",
+            "cook",
+            "cooking",
+            "how do i",
+            "how to",
+            "method",
+            "technique",
+            "calories",
+            "macros",
+            "substitute",
+        ]
+        should_query = "?" in lower or any(t in lower for t in triggers)
+        if not should_query:
+            return
+
+        try:
+            engine = get_cookbook_query_engine()
+            rag_response = engine.query(text)
+            rag_text = str(rag_response).strip()
+            if rag_text:
+                turn_ctx.add_message(
+                    role="assistant",
+                    content=(
+                        "Cookbook context: "
+                        + rag_text
+                    ),
+                )
+        except Exception as e:
+            # Non-fatal: if RAG fails, continue without extra context
+            print(f"[WARN] RAG lookup failed in on_user_turn_completed: {e}")
 
 
 async def entrypoint(ctx: agents.JobContext):
-    # For a Gordon Ramsay persona, you might want to choose a voice that sounds
-    # a bit more gruff or authoritative, if available.
-    # 'c0c374aa-09be-42d9-9828-4d2d7df86962' is your current voice. 
-    # You might consider finding one with a British accent for better effect,
-    # or just stick with this one.
+
+    # Pre-warm the RAG engine so first query is snappy
+    try:
+        _ = get_cookbook_query_engine()
+    except Exception as e:
+        # If indexing fails at startup, proceed without RAG but log the issue.
+        # The tool will raise a useful error if called later.
+        print(f"[WARN] Failed to initialize cookbook index: {e}")
+
     session = AgentSession(
         stt=deepgram.STT(model="nova-3", language="en-US"), # Changed to 'en-US' for better English performance
         llm=openai.LLM(model="gpt-4o-mini"),
         tts=cartesia.TTS(model="sonic-2", voice="63ff761f-c1e8-414b-b969-d1833d1c870c"),
         vad=silero.VAD.load(),
-        # For a single-language agent, you can use the simpler VAD without multilingual detection.
-        # This will be more efficient.
-        # If you want to use the multilingual, that is fine too, as it is robust.
         # turn_detection=MultilingualModel(),
     )
 
     await session.start(
         room=ctx.room,
-        agent=ChefRamsay(), # Changed the class name to reflect the new persona
+        agent=ChefRamsay(),
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC(),
         ),
@@ -72,7 +362,8 @@ async def entrypoint(ctx: agents.JobContext):
             "Greet the user in the persona of Chef Gordon Ramsay. "
             "Tell them you are here to make them a better cook and to "
             "make their meal prep less of a disaster. "
-            "Be demanding and impatient, using phrases like 'don't waste my time'."
+            "Be demanding and impatient, using phrases like 'don't waste my time'. "
+            "Mention that you can pull from a cookbook and convert measurements on command."
         )
     )
 
