@@ -32,9 +32,6 @@ from llama_index.core import (
     Settings,
 )
 from llama_index.core.node_parser import SentenceSplitter
-from llama_index.core.schema import TextNode
-import re
-from typing import List
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.llms.openai import OpenAI as LlamaOpenAI
 
@@ -54,135 +51,6 @@ def _ensure_dirs(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-class RecipeAwareChunker(SentenceSplitter):
-    """Enhanced chunker that detects recipe boundaries and classifies content."""
-    
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        
-    def get_nodes_from_documents(self, documents, show_progress=False, **kwargs):
-        """Override to add recipe-aware processing."""
-        all_nodes = []
-        
-        for document in documents:
-            text = document.get_content()
-            recipe_chunks = self._split_by_recipes(text)
-            
-            for recipe_name, recipe_text in recipe_chunks:
-                # Split recipe into smaller semantic chunks
-                base_chunks = super().split_text(recipe_text)
-                
-                for chunk_text in base_chunks:
-                    content_type = self._classify_content_type(chunk_text)
-                    
-                    # Create enhanced node with metadata
-                    node = TextNode(
-                        text=chunk_text,
-                        metadata={
-                            "recipe_name": recipe_name,
-                            "content_type": content_type,
-                            **document.metadata
-                        }
-                    )
-                    all_nodes.append(node)
-        
-        return all_nodes
-    
-    def _split_by_recipes(self, text: str) -> List[tuple[str, str]]:
-        """Split text into recipe sections and identify recipe names."""
-        lines = text.split('\n')
-        recipes = []
-        current_recipe_name = "Unknown Recipe"
-        current_recipe_lines = []
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-                
-            # Detect recipe titles (common patterns)
-            if self._is_recipe_title(line):
-                # Save previous recipe if exists
-                if current_recipe_lines:
-                    recipes.append((current_recipe_name, '\n'.join(current_recipe_lines)))
-                
-                # Start new recipe
-                current_recipe_name = self._clean_recipe_name(line)
-                current_recipe_lines = [line]
-            else:
-                current_recipe_lines.append(line)
-        
-        # Don't forget the last recipe
-        if current_recipe_lines:
-            recipes.append((current_recipe_name, '\n'.join(current_recipe_lines)))
-        
-        return recipes
-    
-    def _is_recipe_title(self, line: str) -> bool:
-        """Detect if a line is likely a recipe title."""
-        line = line.strip()
-        
-        # Common recipe title patterns
-        title_patterns = [
-            r'^[A-Z][A-Za-z\s&-]+(?:Recipe|Meal Prep|Stir[- ]?Fry|Soup|Salad|Pasta|Chicken|Beef)(?:\s|$)',
-            r'^[A-Z][A-Za-z\s&-]+(?:with|and|in|al|de)\s+[A-Z][A-Za-z\s&-]+$',
-            r'^[A-Z][A-Za-z\s&-]+\s+(?:Bowl|Wrap|Sandwich|Burrito|Tacos?)$',
-        ]
-        
-        # Check patterns
-        for pattern in title_patterns:
-            if re.match(pattern, line):
-                return True
-        
-        # Additional heuristics
-        if (len(line) < 50 and 
-            len(line) > 10 and 
-            line[0].isupper() and 
-            not re.match(r'^\d', line) and  # Not a numbered instruction
-            ':' not in line and  # Not an ingredient line
-            '.' not in line[:20]):  # Not a sentence start
-            return True
-            
-        return False
-    
-    def _clean_recipe_name(self, title_line: str) -> str:
-        """Extract clean recipe name from title line."""
-        # Remove common prefixes/suffixes
-        name = title_line.strip()
-        name = re.sub(r'^(Recipe:?\s*|Meal Prep:?\s*)', '', name, flags=re.IGNORECASE)
-        name = re.sub(r'\s*(Recipe|Meal Prep)\s*$', '', name, flags=re.IGNORECASE)
-        return name.strip()
-    
-    def _classify_content_type(self, text: str) -> str:
-        """Classify chunk content as ingredients, instructions, or other."""
-        text_lower = text.lower()
-        
-        # Ingredient patterns
-        ingredient_patterns = [
-            r'\b\d+\s*(?:cups?|tbsp|tablespoons?|tsp|teaspoons?|lbs?|pounds?|oz|ounces?|grams?|ml|liters?)\b',
-            r'^\s*\d+(?:/\d+)?\s+',  # Starting with fractions or numbers
-            r':\s*$',  # Lines ending with colon (ingredient headers)
-        ]
-        
-        # Instruction patterns  
-        instruction_patterns = [
-            r'^\s*\d+\.',  # Numbered steps
-            r'\b(?:preheat|heat|cook|bake|boil|simmer|sauté|fry|mix|stir|add|place|transfer|remove)\b',
-            r'\b(?:minutes?|hours?|until|degrees?|°[CF])\b',
-        ]
-        
-        # Count pattern matches
-        ingredient_score = sum(1 for p in ingredient_patterns if re.search(p, text))
-        instruction_score = sum(1 for p in instruction_patterns if re.search(p, text_lower))
-        
-        if ingredient_score > instruction_score:
-            return "ingredients"
-        elif instruction_score > 0:
-            return "instructions"
-        else:
-            return "description"
-
-
 def _init_llamaindex_settings() -> None:
     """
     Configure global LlamaIndex settings for embeddings and LLM.
@@ -191,8 +59,8 @@ def _init_llamaindex_settings() -> None:
     # Favor precision for chapter-specific facts
     Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-large")
     Settings.llm = LlamaOpenAI(model="gpt-4o-mini")
-    # Configure recipe-aware chunking
-    Settings.node_parser = RecipeAwareChunker(
+    # Configure robust chunking for better retrieval granularity
+    Settings.node_parser = SentenceSplitter(
         chunk_size=1024,
         chunk_overlap=120,
         separator="\n",
@@ -280,84 +148,6 @@ def get_cookbook_retriever(top_k: int = 6):
 # --------------------------------
 
 @function_tool()
-def get_recipe_details(recipe_name: str, content_type: str = "all") -> str:
-    """
-    Get specific parts of a recipe by name and content type.
-    
-    Args:
-        recipe_name: Name of the recipe to find
-        content_type: Type of content to return - "ingredients", "instructions", "description", or "all"
-    
-    Returns:
-        Formatted recipe information with page citations when available
-    """
-    retriever = get_cookbook_retriever(top_k=10)
-    
-    # Search for the specific recipe
-    search_query = f"recipe {recipe_name}"
-    nodes = retriever.retrieve(search_query)
-    
-    # Filter nodes by recipe name and content type
-    filtered_nodes = []
-    for node in nodes:
-        meta = node.node.metadata or {}
-        node_recipe = meta.get("recipe_name", "").lower()
-        node_content_type = meta.get("content_type", "")
-        
-        # Check if this node belongs to the requested recipe
-        if recipe_name.lower() in node_recipe or node_recipe in recipe_name.lower():
-            if content_type == "all" or node_content_type == content_type:
-                filtered_nodes.append(node)
-    
-    if not filtered_nodes:
-        return f"Could not find recipe '{recipe_name}' or content type '{content_type}' in the cookbook."
-    
-    # Build response organized by content type
-    response_parts = []
-    citations = []
-    
-    # Group by content type
-    ingredients = []
-    instructions = []
-    descriptions = []
-    
-    for node in filtered_nodes[:6]:  # Limit to prevent TTS overload
-        content = (node.node.get_content() or "").strip()
-        if not content:
-            continue
-            
-        meta = node.node.metadata or {}
-        page = meta.get("page_label") or meta.get("page")
-        if page:
-            citations.append(str(page))
-            
-        node_type = meta.get("content_type", "description")
-        clean_content = _clean_text_for_tts(content[:300])
-        
-        if node_type == "ingredients":
-            ingredients.append(clean_content)
-        elif node_type == "instructions":
-            instructions.append(clean_content)
-        else:
-            descriptions.append(clean_content)
-    
-    # Format response
-    if content_type == "ingredients" or (content_type == "all" and ingredients):
-        response_parts.append(f"Ingredients: {'; '.join(ingredients)}")
-    
-    if content_type == "instructions" or (content_type == "all" and instructions):
-        response_parts.append(f"Instructions: {'. '.join(instructions)}")
-        
-    if content_type == "description" or (content_type == "all" and descriptions):
-        response_parts.append(f"Description: {'. '.join(descriptions)}")
-    
-    cite_str = f" (pages {', '.join(dict.fromkeys(citations))})" if citations else ""
-    final_response = f"{recipe_name}: {' | '.join(response_parts)}{cite_str}"
-    
-    return final_response[:800]  # TTS-safe length
-
-
-@function_tool()
 def query_cookbook(question: str) -> str:
     """
     High-precision RAG over the cookbook for chapter-specific facts.
@@ -385,15 +175,15 @@ def query_cookbook(question: str) -> str:
     combined_context = "\n---\n".join(context_chunks)
     cite_str = f" (pages {', '.join(dict.fromkeys(citations))})" if citations else ""
 
-def _clean_text_for_tts(text: str) -> str:
-    """Clean text to be TTS-friendly by removing problematic characters."""
-    import re
-    # Remove or replace problematic characters
-    text = re.sub(r'[^\w\s\.,;:!?()-]', ' ', text)  # Keep basic punctuation
-    text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
-    text = text.replace('&', 'and')  # Replace ampersands
-    text = text.replace('°', ' degrees ')  # Replace degree symbols
-    return text.strip()
+    def _clean_text_for_tts(text: str) -> str:
+        """Clean text to be TTS-friendly by removing problematic characters."""
+        import re
+        # Remove or replace problematic characters
+        text = re.sub(r'[^\w\s\.,;:!?()-]', ' ', text)  # Keep basic punctuation
+        text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
+        text = text.replace('&', 'and')  # Replace ampersands
+        text = text.replace('°', ' degrees ')  # Replace degree symbols
+        return text.strip()
 
     # Synthesize a concise answer using the LLM anchored to retrieved context
     try:
@@ -567,12 +357,11 @@ class ChefRamsay(Agent):
                 "You must use these resources to answer questions and fulfill user requests. "
                 "When the user asks about recipes, ingredients, or meal prep techniques, "
                 "query the cookbook tool to retrieve precise information. "
-                "Use get_recipe_details when users ask for specific parts of a recipe (ingredients, instructions). "
                 "When the user requests conversions (e.g., cups to grams), call the conversion tool. "
                 "Always maintain your Gordon Ramsay persona in responses."
             ),
             # Register tools here per LiveKit's tool-call pattern
-            tools=[query_cookbook, get_recipe_details, convert_measurements],
+            tools=[query_cookbook, convert_measurements],
         )
 
     async def on_user_turn_completed(
