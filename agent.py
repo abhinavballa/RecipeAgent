@@ -39,8 +39,8 @@ load_dotenv()
 
 # RAG configuration constants (used for persistence signature)
 EMBED_MODEL_ID = "text-embedding-3-small"
-CHUNK_SIZE = 512
-CHUNK_OVERLAP = 120
+CHUNK_SIZE = 1024
+CHUNK_OVERLAP = 240
 
 # ---------------------------
 # RAG: Cookbook Index Helpers
@@ -143,12 +143,6 @@ def get_cookbook_retriever(top_k: int = 6):
     return index.as_retriever(similarity_top_k=top_k)
 
 
-# Removed hardcoded topic reranking to support arbitrary cookbooks
-
-
-# --------------------------------
-# Tool: Cookbook RAG Query (LLM-Fn)
-# --------------------------------
 
 @function_tool()
 async def query_cookbook(question: str) -> str:
@@ -173,7 +167,7 @@ async def query_cookbook(question: str) -> str:
         if page is not None:
             citations.append(str(page))
         # keep chunks short to avoid latency
-        context_chunks.append(content[:400])  # Reduced from 800 to 400
+        context_chunks.append(content[:800])  # Reduced from 800 to 400
 
     combined_context = "\n---\n".join(context_chunks)
     cite_str = f" (pages {', '.join(dict.fromkeys(citations))})" if citations else ""
@@ -361,11 +355,11 @@ class ChefRamsay(Agent):
                 "When the user asks about recipes, ingredients, or meal prep techniques, "
                 "query the cookbook tool to retrieve precise information. "
                 "When the user requests conversions (e.g., cups to grams), call the conversion tool. "
-                "Always maintain your Gordon Ramsay persona in responses."
+                "Always maintain your Gordon Ramsay persona in responses, and don't keep any '#' characters in your statement. "
             ),
             # Register tools here per LiveKit's tool-call pattern
-            # tools=[query_cookbook, convert_measurements],
-            tools=[convert_measurements]
+            tools=[query_cookbook, convert_measurements],
+            # tools=[convert_measurements]
         )
 
     async def on_user_turn_completed(
@@ -415,7 +409,7 @@ class ChefRamsay(Agent):
             for n in nodes[:3]:
                 content = (n.node.get_content() or "").strip()
                 if content:
-                    snippets.append(content[:300])  # Reduced from 500 to 300
+                    snippets.append(content[:500])  # Reduced from 500 to 300
                 meta = n.node.metadata or {}
                 page = meta.get("page_label") or meta.get("page")
                 if page is not None:
@@ -464,7 +458,6 @@ async def entrypoint(ctx: agents.JobContext):
         vad=silero.VAD.load(),
         #turn_detection=None,
     )
-    print("BEFORE SESSION")
     await session.start(
         room=ctx.room,
         agent=ChefRamsay(),
@@ -474,12 +467,11 @@ async def entrypoint(ctx: agents.JobContext):
         ),
     )
 
-    print("BEFORE CONNECT")
     await ctx.connect()
 
     # The initial greeting must also be in the Gordon Ramsay persona.
     # This sets the tone from the very beginning.
-    print("BEFORE REPLY")
+
     await session.generate_reply(
         instructions=(
             "Greet the user in the persona of Chef Gordon Ramsay. "
@@ -489,7 +481,6 @@ async def entrypoint(ctx: agents.JobContext):
             "Mention that you can pull from a cookbook and convert measurements on command."
         )
     )
-    print("AFTER REPLY")
 
 
 if __name__ == "__main__":

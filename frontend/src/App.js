@@ -84,6 +84,22 @@ function App() {
         setupParticipantEvents(participant);
       });
 
+      // Register text stream handler for transcriptions (agent + user)
+      newRoom.registerTextStreamHandler('lk.transcription', async (reader, participantInfo) => {
+        try {
+          const message = await reader.readAll();
+          const from = participantInfo?.identity || 'Unknown';
+          const isSelf = from === newRoom.localParticipant.identity;
+          addToTranscript({
+            speaker: isSelf ? 'You' : 'Chef Ramsay',
+            text: message,
+            type: 'transcription',
+          });
+        } catch (e) {
+          console.error('Failed to handle transcription stream:', e);
+        }
+      });
+
       newRoom.on(RoomEvent.LocalTrackPublished, (publication) => {
         console.log('Local track published:', publication.trackName);
       });
@@ -127,18 +143,9 @@ function App() {
   };
 
   const setupParticipantEvents = (participant) => {
-    // Listen for transcript updates
+    // Keep for debugging other tracks; transcription is handled via text stream above
     participant.on('trackSubscribed', (track, publication) => {
-      if (publication.trackName === 'transcript') {
-        track.on('message', (data) => {
-          try {
-            const transcriptData = JSON.parse(data);
-            addToTranscript(transcriptData);
-          } catch (err) {
-            console.error('Failed to parse transcript data:', err);
-          }
-        });
-      }
+      console.log('Subscribed to media track:', publication.trackName, track.kind, 'from', participant.identity);
     });
   };
 
