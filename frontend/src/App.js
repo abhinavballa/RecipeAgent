@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Room, RoomEvent, RemoteParticipant, Participant } from 'livekit-client';
+import { Room, RoomEvent, Track } from 'livekit-client';
 import './App.css';
 
 const LIVEKIT_URL = process.env.REACT_APP_LIVEKIT_URL || 'ws://localhost:7880';
@@ -14,6 +14,7 @@ function App() {
   const [error, setError] = useState(null);
   const [audioEnabled, setAudioEnabled] = useState(true);
   const transcriptRef = useRef(null);
+  const audioElRef = useRef(null);
 
   // Auto-scroll transcript to bottom
   useEffect(() => {
@@ -87,6 +88,18 @@ function App() {
         console.log('Local track published:', publication.trackName);
       });
 
+      // Render remote audio
+      newRoom.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
+        console.log('Track subscribed:', publication.trackName, track.kind, 'from', participant.identity);
+        if (track.kind === Track.Kind.Audio && audioElRef.current) {
+          try {
+            track.attach(audioElRef.current);
+          } catch (e) {
+            console.warn('Failed to attach audio track:', e);
+          }
+        }
+      });
+
       // Get access token
       const token = await generateAccessToken();
       if (!token) {
@@ -95,9 +108,15 @@ function App() {
 
       // Connect to room
       await newRoom.connect(LIVEKIT_URL, token);
+      // Unlock audio playback (must be called in a user gesture)
+      try {
+        await newRoom.startAudio();
+      } catch (e) {
+        console.warn('startAudio failed; user interaction required?', e);
+      }
       
-      // Enable microphone
-      await newRoom.localParticipant.enableCameraAndMicrophone();
+      // Enable microphone only (no camera needed)
+      await newRoom.localParticipant.setMicrophoneEnabled(true);
       
       setRoom(newRoom);
     } catch (err) {
@@ -198,6 +217,9 @@ function App() {
             </div>
           )}
         </div>
+
+        {/* Hidden audio element for remote audio playback */}
+        <audio ref={audioElRef} autoPlay playsInline />
 
         {error && (
           <div className="error">

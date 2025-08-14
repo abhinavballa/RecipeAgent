@@ -37,6 +37,11 @@ from llama_index.llms.openai import OpenAI as LlamaOpenAI
 
 load_dotenv()
 
+# RAG configuration constants (used for persistence signature)
+EMBED_MODEL_ID = "text-embedding-3-small"
+CHUNK_SIZE = 512
+CHUNK_OVERLAP = 120
+
 # ---------------------------
 # RAG: Cookbook Index Helpers
 # ---------------------------
@@ -57,12 +62,12 @@ def _init_llamaindex_settings() -> None:
     We use OpenAI for both, leveraging the OPENAI_API_KEY from the environment.
     """
     # Favor precision for chapter-specific facts
-    Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+    Settings.embed_model = OpenAIEmbedding(model=EMBED_MODEL_ID)
     Settings.llm = LlamaOpenAI(model="gpt-4o-mini")
     # Configure robust chunking for better retrieval granularity
     Settings.node_parser = SentenceSplitter(
-        chunk_size=512,
-        chunk_overlap=120,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
         separator="\n",
     )
 
@@ -79,6 +84,7 @@ def _cookbook_index_dir() -> str:
     return _project_path("storage", "cookbook_index")
 
 
+@lru_cache(maxsize=1)
 def build_or_load_cookbook_index() -> VectorStoreIndex:
     """
     Build a VectorStoreIndex from the cookbook PDF if not already persisted; otherwise load it.
@@ -89,18 +95,14 @@ def build_or_load_cookbook_index() -> VectorStoreIndex:
     # Version the index by embedding model and chunking config to avoid
     # shape mismatches when these settings change between runs.
     def _index_signature() -> str:
-        embed = Settings.embed_model
-        model_id = getattr(embed, "model", getattr(embed, "_model", "unknown"))
-        chunker = Settings.node_parser
-        chunk_size = getattr(chunker, "chunk_size", "na")
-        chunk_overlap = getattr(chunker, "chunk_overlap", "na")
         # include data signature: filenames + mtimes
         pdf_paths = _cookbook_pdf_paths()
         data_sig_src = "|".join(
             f"{os.path.basename(p)}:{int(os.path.getmtime(p))}" for p in pdf_paths
         ) if pdf_paths else "no_docs"
         data_sig = hashlib.md5(data_sig_src.encode("utf-8")).hexdigest()[:12]
-        return f"{model_id}_cs{chunk_size}_co{chunk_overlap}_d{data_sig}"
+        # use explicit constants so directory never starts with 'unknown_'
+        return f"{EMBED_MODEL_ID}_cs{CHUNK_SIZE}_co{CHUNK_OVERLAP}_d{data_sig}"
 
     persist_dir = _project_path("storage", "cookbook_index", _index_signature())
     _ensure_dirs(persist_dir)
@@ -131,10 +133,10 @@ def get_cookbook_query_engine():
     Using an LRU cache ensures we only build/load once per process.
     """
     index = build_or_load_cookbook_index()
-    print("HIIIIIIIIIIII")
     return index.as_query_engine(response_mode="compact")
 
 
+@lru_cache(maxsize=8)
 def get_cookbook_retriever(top_k: int = 6):
     """Return a retriever for the cookbook index."""
     index = build_or_load_cookbook_index()
@@ -149,7 +151,7 @@ def get_cookbook_retriever(top_k: int = 6):
 # --------------------------------
 
 @function_tool()
-def query_cookbook(question: str) -> str:
+async def query_cookbook(question: str) -> str:
     """
     High-precision RAG over the cookbook for chapter-specific facts.
     Returns a concise answer with citations to page numbers when available.
@@ -362,8 +364,8 @@ class ChefRamsay(Agent):
                 "Always maintain your Gordon Ramsay persona in responses."
             ),
             # Register tools here per LiveKit's tool-call pattern
-            tools=[query_cookbook, convert_measurements],
-            # tools=[convert_measurements]
+            # tools=[query_cookbook, convert_measurements],
+            tools=[convert_measurements]
         )
 
     async def on_user_turn_completed(
