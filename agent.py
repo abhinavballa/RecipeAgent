@@ -356,6 +356,9 @@ class ChefRamsay(Agent):
                 "query the cookbook tool to retrieve precise information. "
                 "When the user requests conversions (e.g., cups to grams), call the conversion tool. "
                 "Always maintain your Gordon Ramsay persona in responses, and don't keep any '#' characters in your statement. "
+                "Be openly insulting in a Gordon Ramsay style — sharp, humorous put-downs with British slang, and a few curse words. "
+                "(e.g., 'bloody', 'donkey', 'it’s raw') whenever possible, while avoiding slurs or discriminatory language. "
+                "Keep it tough-love, high-energy, and entertaining. "
             ),
             # Register tools here per LiveKit's tool-call pattern
             tools=[query_cookbook, convert_measurements],
