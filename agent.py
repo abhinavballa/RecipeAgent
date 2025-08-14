@@ -57,11 +57,11 @@ def _init_llamaindex_settings() -> None:
     We use OpenAI for both, leveraging the OPENAI_API_KEY from the environment.
     """
     # Favor precision for chapter-specific facts
-    Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-large")
+    Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
     Settings.llm = LlamaOpenAI(model="gpt-4o-mini")
     # Configure robust chunking for better retrieval granularity
     Settings.node_parser = SentenceSplitter(
-        chunk_size=1024,
+        chunk_size=512,
         chunk_overlap=120,
         separator="\n",
     )
@@ -131,6 +131,7 @@ def get_cookbook_query_engine():
     Using an LRU cache ensures we only build/load once per process.
     """
     index = build_or_load_cookbook_index()
+    print("HIIIIIIIIIIII")
     return index.as_query_engine(response_mode="compact")
 
 
@@ -362,6 +363,7 @@ class ChefRamsay(Agent):
             ),
             # Register tools here per LiveKit's tool-call pattern
             tools=[query_cookbook, convert_measurements],
+            # tools=[convert_measurements]
         )
 
     async def on_user_turn_completed(
@@ -458,21 +460,24 @@ async def entrypoint(ctx: agents.JobContext):
         llm=openai.LLM(model="gpt-4o-mini"),
         tts=cartesia.TTS(model="sonic-2", voice="63ff761f-c1e8-414b-b969-d1833d1c870c"),
         vad=silero.VAD.load(),
-        # turn_detection=MultilingualModel(),
+        #turn_detection=None,
     )
-
+    print("BEFORE SESSION")
     await session.start(
         room=ctx.room,
         agent=ChefRamsay(),
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC(),
+            close_on_disconnect=False,
         ),
     )
 
+    print("BEFORE CONNECT")
     await ctx.connect()
 
     # The initial greeting must also be in the Gordon Ramsay persona.
     # This sets the tone from the very beginning.
+    print("BEFORE REPLY")
     await session.generate_reply(
         instructions=(
             "Greet the user in the persona of Chef Gordon Ramsay. "
@@ -482,6 +487,7 @@ async def entrypoint(ctx: agents.JobContext):
             "Mention that you can pull from a cookbook and convert measurements on command."
         )
     )
+    print("AFTER REPLY")
 
 
 if __name__ == "__main__":
